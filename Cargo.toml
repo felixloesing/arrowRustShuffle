@@ -1,0 +1,3 @@
+[workspace]
+members = ["shuffle-server", "test-client"]
+resolver = "2"

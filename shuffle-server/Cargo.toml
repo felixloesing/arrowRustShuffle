@@ -1,0 +1,21 @@
+[package]
+name = "shuffle-server"
+version = "0.1.0"
+edition = "2021"
+description = "A toy external shuffle service for Apache Spark using Arrow Flight"
+
+[dependencies]
+arrow = { version = "54", features = ["ipc"] }
+arrow-flight = "54"
+arrow-ipc = "54"
+arrow-schema = "54"
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"
+tracing = "0.1"
+tracing-subscriber = "0.3"
