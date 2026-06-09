@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use arrow::array::RecordBatch;
 use tracing::{debug, info};
@@ -11,9 +11,9 @@ use crate::partition::PartitionBuffer;
 type PartitionKey = (String, u32);
 
 /// Central coordinator that routes incoming batches to per-reducer partition
-/// buffers. Thread-safe via `RwLock`.
+/// buffers. Thread-safe via fine-grained per-partition `RwLock`.
 pub struct ShuffleManager {
-    partitions: RwLock<HashMap<PartitionKey, PartitionBuffer>>,
+    partitions: RwLock<HashMap<PartitionKey, Arc<RwLock<PartitionBuffer>>>>,
     spill_threshold_bytes: usize,
     spill_dir: PathBuf,
 }
@@ -42,39 +42,34 @@ impl ShuffleManager {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let key = (shuffle_id.to_string(), reducer_id);
 
-        // Try read lock first to check existence
-        {
+        let buf = {
+            // Try read lock first to check existence
             let partitions = self.partitions.read().map_err(|e| format!("Lock error: {e}"))?;
-            if let Some(_) = partitions.get(&key) {
+            if let Some(buf) = partitions.get(&key) {
+                buf.clone()
+            } else {
                 drop(partitions);
-                // Acquire write lock to push
+                // Acquire write lock to insert new Arc
                 let mut partitions = self.partitions.write().map_err(|e| format!("Lock error: {e}"))?;
-                if let Some(buf) = partitions.get_mut(&key) {
-                    buf.push_batch(batch).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                        format!("Push failed: {e}").into()
-                    })?;
-                    return Ok(());
-                }
+                // Double-check under write lock
+                partitions
+                    .entry(key.clone())
+                    .or_insert_with(|| {
+                        debug!(shuffle_id, reducer_id, "Creating new partition buffer");
+                        Arc::new(RwLock::new(PartitionBuffer::new(
+                            shuffle_id.to_string(),
+                            reducer_id,
+                            self.spill_threshold_bytes,
+                            self.spill_dir.clone(),
+                        )))
+                    })
+                    .clone()
             }
-        }
+        };
 
-        // Key doesn't exist — create new buffer under write lock
-        let mut partitions = self.partitions.write().map_err(|e| format!("Lock error: {e}"))?;
-
-        // Double-check after acquiring write lock
-        if !partitions.contains_key(&key) {
-            debug!(shuffle_id, reducer_id, "Creating new partition buffer");
-            let buf = PartitionBuffer::new(
-                shuffle_id.to_string(),
-                reducer_id,
-                self.spill_threshold_bytes,
-                self.spill_dir.clone(),
-            );
-            partitions.insert(key.clone(), buf);
-        }
-
-        let buf = partitions.get_mut(&key).unwrap();
-        buf.push_batch(batch).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        // Lock only this partition buffer for writing and push
+        let mut buf_guard = buf.write().map_err(|e| format!("Partition lock error: {e}"))?;
+        buf_guard.push_batch(batch).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("Push failed: {e}").into()
         })?;
         Ok(())
@@ -88,11 +83,16 @@ impl ShuffleManager {
         reducer_id: u32,
     ) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error + Send + Sync>> {
         let key = (shuffle_id.to_string(), reducer_id);
-        let partitions = self.partitions.read().map_err(|e| format!("Lock error: {e}"))?;
+        
+        let buf = {
+            let partitions = self.partitions.read().map_err(|e| format!("Lock error: {e}"))?;
+            partitions.get(&key).cloned()
+        };
 
-        match partitions.get(&key) {
+        match buf {
             Some(buf) => {
-                let batches = buf.read_all().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                let buf_guard = buf.read().map_err(|e| format!("Partition lock error: {e}"))?;
+                let batches = buf_guard.read_all().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                     format!("Read failed: {e}").into()
                 })?;
                 info!(
@@ -118,8 +118,12 @@ impl ShuffleManager {
         reducer_id: u32,
     ) -> Option<arrow::datatypes::SchemaRef> {
         let key = (shuffle_id.to_string(), reducer_id);
-        let partitions = self.partitions.read().ok()?;
-        partitions.get(&key)?.schema()
+        let buf = {
+            let partitions = self.partitions.read().ok()?;
+            partitions.get(&key).cloned()?
+        };
+        let buf_guard = buf.read().ok()?;
+        buf_guard.schema()
     }
 
     /// List all registered (shuffle_id, reducer_id) pairs.
@@ -130,18 +134,27 @@ impl ShuffleManager {
 
     /// Clean up all partitions for a given shuffle_id.
     pub fn cleanup_shuffle(&self, shuffle_id: &str) {
-        let mut partitions = self.partitions.write().unwrap();
-        let keys_to_remove: Vec<PartitionKey> = partitions
-            .keys()
-            .filter(|(sid, _)| sid == shuffle_id)
-            .cloned()
-            .collect();
+        let keys_to_remove: Vec<PartitionKey> = {
+            let partitions = self.partitions.read().unwrap();
+            partitions
+                .keys()
+                .filter(|(sid, _)| sid == shuffle_id)
+                .cloned()
+                .collect()
+        };
 
         for key in &keys_to_remove {
-            if let Some(buf) = partitions.get(key) {
-                let _ = buf.cleanup();
+            let buf = {
+                let partitions = self.partitions.read().unwrap();
+                partitions.get(key).cloned()
+            };
+            if let Some(buf) = buf {
+                let buf_guard = buf.read().unwrap();
+                let _ = buf_guard.cleanup();
             }
         }
+
+        let mut partitions = self.partitions.write().unwrap();
         for key in keys_to_remove {
             partitions.remove(&key);
         }
@@ -203,5 +216,33 @@ mod tests {
         let mut parts = mgr.list_partitions();
         parts.sort();
         assert_eq!(parts.len(), 3);
+    }
+
+    #[test]
+    fn test_concurrent_pushes() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = Arc::new(ShuffleManager::new(1024 * 1024, tmp.path().to_path_buf()));
+        let mut handles = vec![];
+
+        // Spawn 10 threads, each pushing to its own reducer partition
+        for i in 0..10 {
+            let mgr_clone = mgr.clone();
+            let handle = std::thread::spawn(move || {
+                for batch_idx in 0..5 {
+                    mgr_clone.push_batch("s1", i, test_batch(batch_idx)).unwrap();
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Verify that all partitions have exactly 5 batches
+        for i in 0..10 {
+            let batches = mgr.read_partition("s1", i).unwrap();
+            assert_eq!(batches.len(), 5);
+        }
     }
 }
