@@ -47,18 +47,18 @@ arrowRustShuffle/
 ├── shuffle-server/             # Shuffle Server Crate
 │   ├── Cargo.toml
 │   └── src/
-│       ├── main.rs              # Server entry point & CLI parser
-│       ├── lib.rs               # Re-exports for test usage
-│       ├── partition.rs         # PartitionBuffer logic (in-memory buffering + spilling)
-│       ├── shuffle_manager.rs   # ShuffleManager (keys routing and management)
-│       └── flight_service.rs    # Arrow Flight Service implementation
+│       ├── main.rs             # Server entry point & CLI parser
+│       ├── lib.rs              # Re-exports for test usage
+│       ├── partition.rs        # PartitionBuffer logic (in-memory buffering + spilling)
+│       ├── shuffle_manager.rs  # ShuffleManager (keys routing and management)
+│       └── flight_service.rs   # Arrow Flight Service implementation
 └── test-client/                # Test Client Crate
     ├── Cargo.toml
     ├── src/
-    │   ├── main.rs              # Standalone client/server demo
-    │   └── lib.rs               # Simulator helpers (mappers & reducers)
+    │   ├── main.rs             # Standalone client/server demo
+    │   └── lib.rs              # Simulator helpers (mappers & reducers)
     └── tests/
-        └── integration_test.rs  # End-to-end integration tests
+        └── integration_test.rs # End-to-end integration tests
 ```
 
 ---
@@ -74,6 +74,8 @@ Manages buffering and disk spilling for a single `(shuffle_id, reducer_id)` part
 
 ### 2. ShuffleManager
 A thread-safe entry point that maps and routes incoming `RecordBatch` streams to the corresponding [PartitionBuffer](shuffle-server/src/partition.rs) based on `(shuffle_id, reducer_id)`.
+- Utilizes fine-grained concurrency with per-partition `Arc<RwLock<PartitionBuffer>>` locking.
+- Employs a double-checked locking pattern for high-performance concurrent writes, allowing parallel mapper pushes and ensuring that disk spilling on one partition does not block writes or reads on other partitions.
 
 ### 3. ShuffleFlightService
 Implements the gRPC-based `FlightService` from the `arrow-flight` crate:
