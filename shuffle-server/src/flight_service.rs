@@ -143,17 +143,9 @@ impl FlightService for ShuffleFlightService {
 
         info!(shuffle_id = %shuffle_id, reducer_id, "DoGet: reducer fetching partition");
 
-        let batches = self
+        let (schema, batch_stream) = self
             .manager
-            .read_partition(&shuffle_id, reducer_id)
-            .map_err(|e| Status::internal(format!("Read error: {e}")))?;
-
-        if batches.is_empty() {
-            return Err(Status::not_found("No data for this partition"));
-        }
-
-        let schema = batches[0].schema();
-        let batch_stream = stream::iter(batches.into_iter().map(Ok));
+            .stream_partition(&shuffle_id, reducer_id)?;
 
         let flight_stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)

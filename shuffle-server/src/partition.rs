@@ -117,12 +117,8 @@ impl PartitionBuffer {
         Ok(())
     }
 
-    /// Read all data for this partition: spilled files first, then in-memory.
-    /// Returns batches in the order they were received.
-    pub fn read_all(&self) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
-        let mut all_batches = Vec::new();
-
-        // Read spilled files in epoch order
+    /// Returns a list of all spilled files on disk in epoch order.
+    pub fn spill_paths(&self) -> Result<Vec<PathBuf>, std::io::Error> {
         let spill_dir = self.partition_spill_dir();
         if spill_dir.exists() {
             let mut spill_files: Vec<PathBuf> = fs::read_dir(&spill_dir)?
@@ -131,19 +127,35 @@ impl PartitionBuffer {
                 .filter(|p| p.extension().map_or(false, |ext| ext == "arrow"))
                 .collect();
             spill_files.sort();
+            Ok(spill_files)
+        } else {
+            Ok(Vec::new())
+        }
+    }
 
-            for spill_path in spill_files {
-                debug!(path = %spill_path.display(), "Reading spill file");
-                let file = File::open(&spill_path)?;
-                let reader = FileReader::try_new(file, None)?;
-                for batch_result in reader {
-                    all_batches.push(batch_result?);
-                }
+    /// Returns a copy of the in-memory record batches.
+    pub fn in_memory_batches(&self) -> Vec<RecordBatch> {
+        self.in_memory.clone()
+    }
+
+    /// Read all data for this partition: spilled files first, then in-memory.
+    /// Returns batches in the order they were received.
+    pub fn read_all(&self) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
+        let mut all_batches = Vec::new();
+
+        // Read spilled files in epoch order
+        let spill_files = self.spill_paths()?;
+        for spill_path in spill_files {
+            debug!(path = %spill_path.display(), "Reading spill file");
+            let file = File::open(&spill_path)?;
+            let reader = FileReader::try_new(file, None)?;
+            for batch_result in reader {
+                all_batches.push(batch_result?);
             }
         }
 
         // Then append in-memory batches
-        all_batches.extend(self.in_memory.iter().cloned());
+        all_batches.extend(self.in_memory_batches());
 
         Ok(all_batches)
     }
