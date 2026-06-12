@@ -1,9 +1,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
+use std::task::{Context, Poll};
 
 use arrow::array::RecordBatch;
 use tracing::{debug, info};
+
+const PREFETCH_BUFFER_SIZE: usize = 8;
 
 use crate::partition::PartitionBuffer;
 
@@ -111,6 +115,92 @@ impl ShuffleManager {
         }
     }
 
+    /// Read all batches for a (shuffle_id, reducer_id) partition lazily.
+    /// Returns the schema and a stream of FlightData-compatible batches.
+    pub fn stream_partition(
+        &self,
+        shuffle_id: &str,
+        reducer_id: u32,
+    ) -> Result<(
+        arrow::datatypes::SchemaRef,
+        RxStream<Result<RecordBatch, arrow_flight::error::FlightError>>,
+    ), tonic::Status> {
+        let key = (shuffle_id.to_string(), reducer_id);
+
+        let buf = {
+            let partitions = self.partitions.read().map_err(|e| {
+                tonic::Status::internal(format!("Lock error: {e}"))
+            })?;
+            partitions
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| tonic::Status::not_found("Partition not found"))?
+        };
+
+        let buf_guard = buf.read().map_err(|e| {
+            tonic::Status::internal(format!("Partition lock error: {e}"))
+        })?;
+
+        let schema = buf_guard
+            .schema()
+            .ok_or_else(|| tonic::Status::not_found("Partition has no schema/data"))?;
+
+        let spill_files = buf_guard.spill_paths().map_err(|e| {
+            tonic::Status::internal(format!("Failed to list spill files: {e}"))
+        })?;
+        let in_memory = buf_guard.in_memory_batches();
+
+        drop(buf_guard);
+
+        let (tx, rx) = tokio::sync::mpsc::channel(PREFETCH_BUFFER_SIZE);
+
+        tokio::task::spawn_blocking(move || {
+            // Phase 1: Stream spill files from disk
+            for path in spill_files {
+                let file = match std::fs::File::open(&path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let arrow_err = arrow::error::ArrowError::IoError(
+                            format!("Failed to open spill file: {e}"),
+                            e,
+                        );
+                        let _ = tx.blocking_send(Err(arrow_flight::error::FlightError::from(arrow_err)));
+                        return;
+                    }
+                };
+                let reader = match arrow_ipc::reader::FileReader::try_new(file, None) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(arrow_flight::error::FlightError::from(e)));
+                        return;
+                    }
+                };
+                for batch_result in reader {
+                    match batch_result {
+                        Ok(batch) => {
+                            if tx.blocking_send(Ok(batch)).is_err() {
+                                return; // channel closed
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.blocking_send(Err(arrow_flight::error::FlightError::from(e)));
+                            return;
+                        }
+                    }
+                }
+            }
+
+            // Phase 2: Stream in-memory batches
+            for batch in in_memory {
+                if tx.blocking_send(Ok(batch)).is_err() {
+                    return; // channel closed
+                }
+            }
+        });
+
+        Ok((schema, RxStream::new(rx)))
+    }
+
     /// Get the schema for a partition (if it exists and has data).
     pub fn get_schema(
         &self,
@@ -159,6 +249,25 @@ impl ShuffleManager {
             partitions.remove(&key);
         }
         info!(shuffle_id, "Shuffle cleaned up");
+    }
+}
+
+/// A helper stream that wraps a Tokio MPSC receiver.
+pub struct RxStream<T> {
+    rx: tokio::sync::mpsc::Receiver<T>,
+}
+
+impl<T> RxStream<T> {
+    pub fn new(rx: tokio::sync::mpsc::Receiver<T>) -> Self {
+        Self { rx }
+    }
+}
+
+impl<T> futures::Stream for RxStream<T> {
+    type Item = T;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
     }
 }
 
@@ -244,5 +353,29 @@ mod tests {
             let batches = mgr.read_partition("s1", i).unwrap();
             assert_eq!(batches.len(), 5);
         }
+    }
+
+    #[tokio::test]
+    async fn test_lazy_stream() {
+        use futures::StreamExt;
+        let tmp = TempDir::new().unwrap();
+        // 1 byte threshold to force spilling
+        let mgr = ShuffleManager::new(1, tmp.path().to_path_buf());
+
+        mgr.push_batch("s1", 0, test_batch(1)).unwrap();
+        mgr.push_batch("s1", 0, test_batch(2)).unwrap();
+
+        let (schema, mut stream) = mgr.stream_partition("s1", 0).unwrap();
+        assert_eq!(schema.fields().len(), 2);
+
+        let mut results = vec![];
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result.unwrap();
+            results.push(batch);
+        }
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].num_rows(), 1);
+        assert_eq!(results[1].num_rows(), 1);
     }
 }
