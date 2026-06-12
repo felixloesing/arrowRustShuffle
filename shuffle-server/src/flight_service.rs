@@ -197,9 +197,14 @@ impl FlightService for ShuffleFlightService {
                 Ok(batch) => {
                     row_count += batch.num_rows() as u64;
                     batch_count += 1;
-                    self.manager
-                        .push_batch(&shuffle_id, reducer_id, batch)
-                        .map_err(|e| Status::internal(format!("Push error: {e}")))?;
+                    let manager = self.manager.clone();
+                    let shuffle_id_clone = shuffle_id.clone();
+                    tokio::task::spawn_blocking(move || {
+                        manager.push_batch(&shuffle_id_clone, reducer_id, batch)
+                    })
+                    .await
+                    .map_err(|e| Status::internal(format!("Join error: {e}")))?
+                    .map_err(|e| Status::internal(format!("Push error: {e}")))?;
                 }
                 Err(e) => {
                     error!("Error decoding flight data: {e}");
