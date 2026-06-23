@@ -13,7 +13,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let spill_threshold = 4 * 1024; // 4 KB — low threshold to demonstrate spilling
 
     // Start the embedded shuffle server
-    let port = start_test_server(spill_threshold, tmp_dir.path().to_path_buf()).await;
+    let port = start_test_server(spill_threshold, tmp_dir.path().to_path_buf(), None).await;
     println!("Server started on port {port}");
 
     let shuffle_id = "demo_shuffle_1";

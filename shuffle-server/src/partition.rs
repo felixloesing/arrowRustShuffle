@@ -1,6 +1,7 @@
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::RecordBatch;
@@ -8,6 +9,8 @@ use arrow::datatypes::SchemaRef;
 use arrow_ipc::reader::FileReader;
 use arrow_ipc::writer::FileWriter;
 use tracing::{debug, info};
+
+use crate::memory_manager::MemoryManager;
 
 /// A buffer for a single (shuffle_id, reducer_id) partition.
 ///
@@ -20,10 +23,11 @@ pub struct PartitionBuffer {
     pub reducer_id: u32,
     schema: Option<SchemaRef>,
     in_memory: Vec<RecordBatch>,
-    memory_bytes: usize,
+    pub memory_bytes: usize,
     spill_threshold_bytes: usize,
     spill_dir: PathBuf,
     epoch: AtomicUsize,
+    memory_manager: Arc<MemoryManager>,
 }
 
 impl PartitionBuffer {
@@ -32,6 +36,7 @@ impl PartitionBuffer {
         reducer_id: u32,
         spill_threshold_bytes: usize,
         spill_dir: PathBuf,
+        memory_manager: Arc<MemoryManager>,
     ) -> Self {
         Self {
             shuffle_id,
@@ -42,6 +47,7 @@ impl PartitionBuffer {
             spill_threshold_bytes,
             spill_dir,
             epoch: AtomicUsize::new(0),
+            memory_manager,
         }
     }
 
@@ -64,11 +70,15 @@ impl PartitionBuffer {
         self.memory_bytes += batch_size;
         self.in_memory.push(batch);
 
+        // Reserve globally
+        self.memory_manager.reserve(batch_size);
+
         debug!(
             shuffle_id = %self.shuffle_id,
             reducer_id = self.reducer_id,
             memory_bytes = self.memory_bytes,
             threshold = self.spill_threshold_bytes,
+            global_used = self.memory_manager.used_bytes(),
             "Pushed batch"
         );
 
@@ -80,7 +90,7 @@ impl PartitionBuffer {
     }
 
     /// Spill current in-memory batches to an Arrow IPC file.
-    fn spill_to_disk(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn spill_to_disk(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.in_memory.is_empty() {
             return Ok(());
         }
@@ -113,6 +123,8 @@ impl PartitionBuffer {
         }
         writer.finish()?;
 
+        // Release globally
+        self.memory_manager.release(self.memory_bytes);
         self.memory_bytes = 0;
         Ok(())
     }
@@ -180,6 +192,14 @@ impl PartitionBuffer {
     }
 }
 
+impl Drop for PartitionBuffer {
+    fn drop(&mut self) {
+        if self.memory_bytes > 0 {
+            self.memory_manager.release(self.memory_bytes);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,11 +232,13 @@ mod tests {
     fn test_push_and_read_in_memory() {
         let tmp = TempDir::new().unwrap();
         let schema = test_schema();
+        let mem_mgr = Arc::new(MemoryManager::new(100 * 1024 * 1024, 85, 60, 95));
         let mut buf = PartitionBuffer::new(
             "shuffle_1".into(),
             0,
             1024 * 1024, // 1MB threshold — won't spill
             tmp.path().to_path_buf(),
+            mem_mgr,
         );
 
         buf.push_batch(test_batch(&schema, 10)).unwrap();
@@ -233,12 +255,14 @@ mod tests {
     fn test_spill_to_disk() {
         let tmp = TempDir::new().unwrap();
         let schema = test_schema();
+        let mem_mgr = Arc::new(MemoryManager::new(100 * 1024 * 1024, 85, 60, 95));
         // Very low threshold to force spilling
         let mut buf = PartitionBuffer::new(
             "shuffle_1".into(),
             0,
             1, // 1 byte threshold — will spill immediately
             tmp.path().to_path_buf(),
+            mem_mgr,
         );
 
         buf.push_batch(test_batch(&schema, 100)).unwrap();

@@ -13,7 +13,8 @@ In traditional pull-based shuffles, $M$ mappers write partition files locally on
 This service utilizes a **push-based shuffle** design:
 1. **Push Phase**: Mappers push their `RecordBatch` streams directly to the shuffle service using Arrow Flight's `DoPut` RPC, targeting a specific `(shuffle_id, reducer_id)` partition.
 2. **Aggregation & Spilling**: The server aggregates batches for each `reducer_id` in-memory. If a partition's memory footprint exceeds the configured threshold, the server spills the data as a consolidated `.arrow` IPC file to disk.
-3. **Fetch Phase**: Reducers fetch their aggregated stream using Arrow Flight's `DoGet` RPC, which streams the spilled files followed by any remaining in-memory batches.
+3. **Global Memory Management**: A central `MemoryManager` tracks global memory usage across all partitions. When usage crosses the high watermark, it triggers background spills of the largest partitions. If usage hits the hard limit, backpressure is applied to mappers until memory drops below the low watermark.
+4. **Fetch Phase**: Reducers fetch their aggregated stream using Arrow Flight's `DoGet` RPC, which streams the spilled files followed by any remaining in-memory batches.
 
 ```mermaid
 graph LR
@@ -26,6 +27,7 @@ graph LR
 
     subgraph Shuffle Server
         S --> SM[ShuffleManager]
+        SM --> MM[MemoryManager]
         SM --> PB0["PartitionBuffer<br/>reducer_0"]
         SM --> PB1["PartitionBuffer<br/>reducer_1"]
         SM --> PBM["PartitionBuffer<br/>reducer_M"]
@@ -49,6 +51,7 @@ arrowRustShuffle/
 │   └── src/
 │       ├── main.rs             # Server entry point & CLI parser
 │       ├── lib.rs              # Re-exports for test usage
+│       ├── memory_manager.rs   # Global memory tracking & watermarks
 │       ├── partition.rs        # PartitionBuffer logic (in-memory buffering + spilling)
 │       ├── shuffle_manager.rs  # ShuffleManager (keys routing and management)
 │       └── flight_service.rs   # Arrow Flight Service implementation
@@ -71,13 +74,24 @@ Manages buffering and disk spilling for a single `(shuffle_id, reducer_id)` part
 - Dynamically tracks buffer memory footprint via `RecordBatch::get_array_memory_size`.
 - Spills to `.arrow` IPC files in the directory `spill_dir/{shuffle_id}/reducer_{id}/spill_{epoch}.arrow` when the memory threshold is reached.
 - Streams back merged data in sequential order (spill files first, then remaining memory buffer).
+- Reports memory usage to the global `MemoryManager` on push, spill, and drop.
 
-### 2. ShuffleManager
+### 2. MemoryManager
+A centralized, lock-free memory tracker shared across all partitions.
+- Uses `AtomicUsize` for contention-free global memory accounting.
+- Three configurable watermark thresholds control behavior:
+  - **High watermark** (default 85%): Triggers background spills of the largest partitions.
+  - **Low watermark** (default 60%): Spilling continues until usage drops below this level.
+  - **Hard limit** (default 95%): Applies backpressure — mapper `DoPut` calls are paused until memory is freed.
+- Prevents OOM by ensuring total memory usage stays bounded regardless of the number of active partitions.
+
+### 3. ShuffleManager
 A thread-safe entry point that maps and routes incoming `RecordBatch` streams to the corresponding [PartitionBuffer](shuffle-server/src/partition.rs) based on `(shuffle_id, reducer_id)`.
 - Utilizes fine-grained concurrency with per-partition `Arc<RwLock<PartitionBuffer>>` locking.
 - Employs a double-checked locking pattern for high-performance concurrent writes, allowing parallel mapper pushes and ensuring that disk spilling on one partition does not block writes or reads on other partitions.
+- Enforces global memory limits before each push by delegating to `MemoryManager`.
 
-### 3. ShuffleFlightService
+### 4. ShuffleFlightService
 Implements the gRPC-based `FlightService` from the `arrow-flight` crate:
 
 | RPC Method | Descriptor/Ticket Format | Purpose |
@@ -106,9 +120,27 @@ cargo run -p shuffle-server -- --port 50051 --spill-dir /tmp/shuffle-spill --spi
 ```
 
 #### CLI Configuration Options:
-- `--port`: The port to run the server on (default: `50051`).
-- `--spill-dir`: Location where spilled `.arrow` files will be written (default: `/tmp/shuffle-spill`).
-- `--spill-threshold-mb`: Max memory size in MB for a single partition buffer before spilling to disk (default: `64`).
+| Flag | Description | Default |
+| :--- | :--- | :--- |
+| `--port` | Port to run the server on | `50051` |
+| `--spill-dir` | Location where spilled `.arrow` files will be written | `/tmp/shuffle-spill` |
+| `--spill-threshold-mb` | Max memory (MB) for a single partition before spilling to disk | `64` |
+| `--global-memory-limit-mb` | Total memory budget (MB) for all partition buffers combined | `1024` |
+| `--global-memory-high-watermark-pct` | % of global limit that triggers background spills | `85` |
+| `--global-memory-low-watermark-pct` | % of global limit below which spilling stops | `60` |
+| `--global-memory-hard-limit-pct` | % of global limit that triggers mapper backpressure | `95` |
+
+#### Example with memory limits:
+```bash
+cargo run -p shuffle-server -- \
+  --port 50051 \
+  --spill-dir /tmp/shuffle-spill \
+  --spill-threshold-mb 64 \
+  --global-memory-limit-mb 2048 \
+  --global-memory-high-watermark-pct 80 \
+  --global-memory-low-watermark-pct 50 \
+  --global-memory-hard-limit-pct 90
+```
 
 ### Running the Demo Client
 
@@ -128,3 +160,5 @@ The tests cover:
 - In-memory partition buffer lifecycle.
 - Spill-to-disk verification and file path checks.
 - End-to-end mapper-to-reducer Arrow Flight integration.
+- Global memory manager cross-partition spill triggering.
+

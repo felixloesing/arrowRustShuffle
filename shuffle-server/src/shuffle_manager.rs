@@ -5,10 +5,11 @@ use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 
 use arrow::array::RecordBatch;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 const PREFETCH_BUFFER_SIZE: usize = 8;
 
+use crate::memory_manager::MemoryManager;
 use crate::partition::PartitionBuffer;
 
 /// Key for partition lookup: (shuffle_id, reducer_id).
@@ -20,12 +21,19 @@ pub struct ShuffleManager {
     partitions: RwLock<HashMap<PartitionKey, Arc<RwLock<PartitionBuffer>>>>,
     spill_threshold_bytes: usize,
     spill_dir: PathBuf,
+    memory_manager: Arc<MemoryManager>,
+    spill_in_progress: std::sync::atomic::AtomicBool,
 }
 
 impl ShuffleManager {
-    pub fn new(spill_threshold_bytes: usize, spill_dir: PathBuf) -> Self {
+    pub fn new(
+        spill_threshold_bytes: usize,
+        spill_dir: PathBuf,
+        memory_manager: Arc<MemoryManager>,
+    ) -> Self {
         info!(
             spill_threshold_bytes,
+            global_mem_limit = memory_manager.limit_bytes(),
             spill_dir = %spill_dir.display(),
             "ShuffleManager created"
         );
@@ -33,6 +41,8 @@ impl ShuffleManager {
             partitions: RwLock::new(HashMap::new()),
             spill_threshold_bytes,
             spill_dir,
+            memory_manager,
+            spill_in_progress: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -44,6 +54,8 @@ impl ShuffleManager {
         reducer_id: u32,
         batch: RecordBatch,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.enforce_memory_limit();
+
         let key = (shuffle_id.to_string(), reducer_id);
 
         let buf = {
@@ -65,6 +77,7 @@ impl ShuffleManager {
                             reducer_id,
                             self.spill_threshold_bytes,
                             self.spill_dir.clone(),
+                            self.memory_manager.clone(),
                         )))
                     })
                     .clone()
@@ -250,6 +263,88 @@ impl ShuffleManager {
         }
         info!(shuffle_id, "Shuffle cleaned up");
     }
+
+    /// Enforces the global memory limit, triggering background spills if the high
+    /// watermark is crossed and sleeping/backpressuring if the hard limit is hit.
+    fn enforce_memory_limit(&self) {
+        if self.memory_manager.is_over_high_watermark() {
+            self.trigger_global_spill();
+        }
+
+        let mut loops = 0;
+        while self.memory_manager.is_over_hard_limit() {
+            loops += 1;
+            if loops % 10 == 1 {
+                debug!(
+                    used = self.memory_manager.used_bytes(),
+                    limit = self.memory_manager.limit_bytes(),
+                    "Backpressure active: memory hard limit exceeded, sleeping..."
+                );
+                self.trigger_global_spill();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Iterates over partitions descending by in-memory size and triggers spills
+    /// on them using non-blocking try_lock until usage falls below the low watermark.
+    fn trigger_global_spill(&self) {
+        if self.spill_in_progress.compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ).is_err() {
+            // Spill is already in progress, avoid redundant scan/spill
+            return;
+        }
+
+        struct SpillGuard<'a>(&'a std::sync::atomic::AtomicBool);
+        impl<'a> Drop for SpillGuard<'a> {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _guard = SpillGuard(&self.spill_in_progress);
+
+        let mut partition_usages = {
+            let partitions = self.partitions.read().unwrap();
+            let mut usages = Vec::new();
+            for (key, buf_arc) in partitions.iter() {
+                if let Ok(buf_guard) = buf_arc.read() {
+                    let bytes = buf_guard.memory_bytes;
+                    if bytes > 0 {
+                        usages.push((key.clone(), buf_arc.clone(), bytes));
+                    }
+                }
+            }
+            usages
+        };
+
+        partition_usages.sort_by(|a, b| b.2.cmp(&a.2));
+
+        for (key, buf_arc, bytes) in partition_usages {
+            if self.memory_manager.is_below_low_watermark() {
+                break;
+            }
+
+            if let Ok(mut buf_guard) = buf_arc.try_write() {
+                if buf_guard.memory_bytes > 0 {
+                    info!(
+                        shuffle_id = %key.0,
+                        reducer_id = key.1,
+                        bytes,
+                        "Global memory manager triggering spill on partition"
+                    );
+                    if let Err(e) = buf_guard.spill_to_disk() {
+                        error!("Global spill failed for partition {:?}: {:?}", key, e);
+                    }
+                }
+            } else {
+                debug!("Failed to acquire try_write lock for partition {:?}, skipping", key);
+            }
+        }
+    }
 }
 
 /// A helper stream that wraps a Tokio MPSC receiver.
@@ -274,10 +369,21 @@ impl<T> futures::Stream for RxStream<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory_manager::MemoryManager;
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    /// Helper: create a default MemoryManager with generous limits for unit tests.
+    fn default_memory_manager() -> Arc<MemoryManager> {
+        Arc::new(MemoryManager::new(
+            1024 * 1024 * 1024, // 1 GB
+            85,
+            60,
+            95,
+        ))
+    }
 
     fn test_batch(n: i32) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -297,7 +403,7 @@ mod tests {
     #[test]
     fn test_push_and_read() {
         let tmp = TempDir::new().unwrap();
-        let mgr = ShuffleManager::new(1024 * 1024, tmp.path().to_path_buf());
+        let mgr = ShuffleManager::new(1024 * 1024, tmp.path().to_path_buf(), default_memory_manager());
 
         mgr.push_batch("s1", 0, test_batch(1)).unwrap();
         mgr.push_batch("s1", 0, test_batch(2)).unwrap();
@@ -316,7 +422,7 @@ mod tests {
     #[test]
     fn test_list_partitions() {
         let tmp = TempDir::new().unwrap();
-        let mgr = ShuffleManager::new(1024 * 1024, tmp.path().to_path_buf());
+        let mgr = ShuffleManager::new(1024 * 1024, tmp.path().to_path_buf(), default_memory_manager());
 
         mgr.push_batch("s1", 0, test_batch(1)).unwrap();
         mgr.push_batch("s1", 1, test_batch(2)).unwrap();
@@ -330,7 +436,7 @@ mod tests {
     #[test]
     fn test_concurrent_pushes() {
         let tmp = TempDir::new().unwrap();
-        let mgr = Arc::new(ShuffleManager::new(1024 * 1024, tmp.path().to_path_buf()));
+        let mgr = Arc::new(ShuffleManager::new(1024 * 1024, tmp.path().to_path_buf(), default_memory_manager()));
         let mut handles = vec![];
 
         // Spawn 10 threads, each pushing to its own reducer partition
@@ -360,7 +466,7 @@ mod tests {
         use futures::StreamExt;
         let tmp = TempDir::new().unwrap();
         // 1 byte threshold to force spilling
-        let mgr = ShuffleManager::new(1, tmp.path().to_path_buf());
+        let mgr = ShuffleManager::new(1, tmp.path().to_path_buf(), default_memory_manager());
 
         mgr.push_batch("s1", 0, test_batch(1)).unwrap();
         mgr.push_batch("s1", 0, test_batch(2)).unwrap();
