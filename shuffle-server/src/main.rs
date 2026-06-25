@@ -39,6 +39,14 @@ struct Args {
     /// Hard limit percentage of global memory limit; applies backpressure to mappers
     #[arg(long, default_value_t = 95)]
     global_memory_hard_limit_pct: u8,
+
+    /// Time-to-live for a shuffle's data in seconds before automatic cleanup (0 to disable)
+    #[arg(long, default_value_t = 7200)]
+    shuffle_ttl_secs: u64,
+
+    /// How frequently to check for expired shuffles (in seconds)
+    #[arg(long, default_value_t = 60)]
+    shuffle_cleanup_interval_secs: u64,
 }
 
 #[tokio::main]
@@ -69,6 +77,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.spill_dir,
         memory_manager,
     ));
+
+    // Spawn the background TTL cleanup task if TTL is enabled (>0)
+    if args.shuffle_ttl_secs > 0 {
+        let manager_clone = manager.clone();
+        let ttl = std::time::Duration::from_secs(args.shuffle_ttl_secs);
+        let interval = std::time::Duration::from_secs(args.shuffle_cleanup_interval_secs);
+        info!(
+            ttl_secs = args.shuffle_ttl_secs,
+            interval_secs = args.shuffle_cleanup_interval_secs,
+            "Spawning background shuffle TTL cleanup task"
+        );
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                manager_clone.cleanup_expired_shuffles(ttl);
+            }
+        });
+    }
 
     let service = ShuffleFlightService::new(manager);
     let svc = FlightServiceServer::new(service);

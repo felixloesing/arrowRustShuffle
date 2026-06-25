@@ -14,7 +14,7 @@ async fn test_full_shuffle_round_trip() {
     let tmp_dir = TempDir::new().unwrap();
     let spill_threshold = 4 * 1024; // 4 KB to force spilling
 
-    let port = start_test_server(spill_threshold, tmp_dir.path().to_path_buf(), None).await;
+    let port = start_test_server(spill_threshold, tmp_dir.path().to_path_buf(), None, None, None).await;
 
     let shuffle_id = "test_shuffle_1";
     let num_mappers = 4u32;
@@ -105,7 +105,7 @@ async fn test_get_nonexistent_partition() {
     let _ = tracing_subscriber::fmt::try_init();
 
     let tmp_dir = TempDir::new().unwrap();
-    let port = start_test_server(1024 * 1024, tmp_dir.path().to_path_buf(), None).await;
+    let port = start_test_server(1024 * 1024, tmp_dir.path().to_path_buf(), None, None, None).await;
 
     let mut client = connect_client(port).await;
     let ticket = arrow_flight::Ticket::new("nonexistent/42".to_string());
@@ -122,7 +122,7 @@ async fn test_no_spill_when_threshold_large() {
     let tmp_dir = TempDir::new().unwrap();
     let spill_threshold = 100 * 1024 * 1024; // 100 MB
 
-    let port = start_test_server(spill_threshold, tmp_dir.path().to_path_buf(), None).await;
+    let port = start_test_server(spill_threshold, tmp_dir.path().to_path_buf(), None, None, None).await;
 
     let shuffle_id = "no_spill_shuffle";
     let mut client = connect_client(port).await;
@@ -162,7 +162,7 @@ async fn test_global_memory_manager_spill() {
     // Global limit very low — forces the memory manager to trigger spills
     let global_memory_limit = Some(8 * 1024); // 8 KB
 
-    let port = start_test_server(spill_threshold, tmp_dir.path().to_path_buf(), global_memory_limit).await;
+    let port = start_test_server(spill_threshold, tmp_dir.path().to_path_buf(), global_memory_limit, None, None).await;
 
     let shuffle_id = "global_mem_test";
     let num_mappers = 2u32;
@@ -245,5 +245,97 @@ async fn test_global_memory_manager_spill() {
     println!(
         "Global memory manager test: {arrow_file_count} spill files created across {num_reducers} reducer partitions"
     );
+}
+
+/// Test the CleanShuffle DoAction explicitly.
+#[tokio::test]
+async fn test_explicit_clean_shuffle_action() {
+    use futures::{StreamExt, TryStreamExt};
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let tmp_dir = TempDir::new().unwrap();
+    let spill_threshold = 4 * 1024; // 4 KB to force spilling
+
+    let port = start_test_server(spill_threshold, tmp_dir.path().to_path_buf(), None, None, None).await;
+
+    let shuffle_id = "clean_test_shuffle";
+
+    // Push some data to trigger partition buffer creation and disk spilling
+    let mut client = connect_client(port).await;
+    run_mapper(&mut client, shuffle_id, 0, 2, 100, 2).await;
+
+    // Verify spill directories exist
+    let spill_base = tmp_dir.path().join(shuffle_id);
+    assert!(spill_base.exists(), "Spill directory should exist before clean");
+
+    // Send CleanShuffle action
+    let action = arrow_flight::Action {
+        r#type: "CleanShuffle".to_string(),
+        body: shuffle_id.as_bytes().to_vec().into(),
+    };
+
+    let response = client.do_action(action).await.unwrap();
+    let mut stream = response.into_inner();
+
+    // Read response from action
+    let mut results = Vec::new();
+    while let Some(res) = stream.next().await {
+        let action_res = res.unwrap();
+        results.push(String::from_utf8_lossy(&action_res.body).into_owned());
+    }
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].contains("Successfully cleaned shuffle"));
+
+    // Verify spill directories are cleaned up
+    assert!(!spill_base.exists(), "Spill directory should have been deleted");
+
+    // Verify that retrieving the partition now returns empty or nonexistent
+    // Since the partitions map was cleared, getting schema or get_flight_info will fail/not find it.
+    let list_response = client.list_flights(arrow_flight::Criteria::default()).await.unwrap();
+    let flights: Vec<_> = list_response.into_inner().try_collect().await.unwrap();
+
+    // Verify none of the flights have this shuffle_id
+    for flight in flights {
+        let descriptor = flight.flight_descriptor.unwrap();
+        assert_ne!(descriptor.path[0], shuffle_id);
+    }
+}
+
+/// Test the background TTL cleanup task.
+#[tokio::test]
+async fn test_background_ttl_cleanup() {
+    use futures::TryStreamExt;
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let tmp_dir = TempDir::new().unwrap();
+    let spill_threshold = 4 * 1024; // 4 KB to force spilling
+
+    // Server started with a 1 second TTL and a 1 second cleanup check interval
+    let port = start_test_server(spill_threshold, tmp_dir.path().to_path_buf(), None, Some(1), Some(1)).await;
+
+    let shuffle_id = "ttl_test_shuffle";
+
+    // Push some data to trigger partition buffer creation and disk spilling
+    let mut client = connect_client(port).await;
+    run_mapper(&mut client, shuffle_id, 0, 2, 100, 2).await;
+
+    // Verify spill directories exist
+    let spill_base = tmp_dir.path().join(shuffle_id);
+    assert!(spill_base.exists(), "Spill directory should exist before expiration");
+
+    // Wait for TTL (1 sec) + check interval (1 sec) to guarantee expiration
+    tokio::time::sleep(tokio::time::Duration::from_millis(2500)).await;
+
+    // Verify spill directories are cleaned up automatically
+    assert!(!spill_base.exists(), "Spill directory should have been cleaned up by TTL");
+
+    // Verify list_flights is empty for this shuffle
+    let list_response = client.list_flights(arrow_flight::Criteria::default()).await.unwrap();
+    let flights: Vec<_> = list_response.into_inner().try_collect().await.unwrap();
+    for flight in flights {
+        let descriptor = flight.flight_descriptor.unwrap();
+        assert_ne!(descriptor.path[0], shuffle_id);
+    }
 }
 
