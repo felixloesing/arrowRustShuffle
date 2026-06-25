@@ -43,11 +43,21 @@ pub fn generate_test_batch(partition_id: i32, num_rows: usize) -> RecordBatch {
 
 /// Start an in-process shuffle server on a random available port.
 /// Returns the port number once the server is ready.
+///
+/// If `global_memory_limit_bytes` is `None`, defaults to 1 GB with standard watermarks.
 pub async fn start_test_server(
     spill_threshold_bytes: usize,
     spill_dir: std::path::PathBuf,
+    global_memory_limit_bytes: Option<usize>,
 ) -> u16 {
-    let manager = Arc::new(ShuffleManager::new(spill_threshold_bytes, spill_dir));
+    let mem_limit = global_memory_limit_bytes.unwrap_or(1024 * 1024 * 1024);
+    let memory_manager = Arc::new(shuffle_server::MemoryManager::new(
+        mem_limit,
+        85,
+        60,
+        95,
+    ));
+    let manager = Arc::new(ShuffleManager::new(spill_threshold_bytes, spill_dir, memory_manager));
     let service = ShuffleFlightService::new(manager);
     let svc = FlightServiceServer::new(service);
 
