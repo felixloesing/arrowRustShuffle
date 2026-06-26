@@ -61,8 +61,13 @@ impl PartitionBuffer {
     /// Push a RecordBatch into this partition buffer.
     /// If the memory threshold is exceeded after push, spill to disk.
     pub fn push_batch(&mut self, batch: RecordBatch) -> Result<(), Box<dyn std::error::Error>> {
-        // Capture schema from first batch
-        if self.schema.is_none() {
+        // Validate schema compatibility if a schema is already set
+        if let Some(ref schema) = self.schema {
+            if schema.fields() != batch.schema().fields() {
+                return Err("Schema mismatch: incoming batch fields do not match partition schema".into());
+            }
+        } else {
+            // Capture schema from first batch
             self.schema = Some(batch.schema());
         }
 

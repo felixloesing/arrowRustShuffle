@@ -204,7 +204,14 @@ impl FlightService for ShuffleFlightService {
                     })
                     .await
                     .map_err(|e| Status::internal(format!("Join error: {e}")))?
-                    .map_err(|e| Status::internal(format!("Push error: {e}")))?;
+                    .map_err(|e| {
+                        let err_msg = e.to_string();
+                        if err_msg.contains("Schema mismatch") {
+                            Status::invalid_argument(err_msg)
+                        } else {
+                            Status::internal(format!("Push error: {err_msg}"))
+                        }
+                    })?;
                 }
                 Err(e) => {
                     error!("Error decoding flight data: {e}");
