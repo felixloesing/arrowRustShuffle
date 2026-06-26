@@ -339,3 +339,75 @@ async fn test_background_ttl_cleanup() {
     }
 }
 
+/// Test that pushing a RecordBatch with a mismatched schema fails with InvalidArgument status.
+#[tokio::test]
+async fn test_schema_compatibility_mismatch() {
+    use futures::StreamExt;
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let tmp_dir = TempDir::new().unwrap();
+    let port = start_test_server(1024 * 1024, tmp_dir.path().to_path_buf(), None, None, None).await;
+
+    let shuffle_id = "schema_mismatch_shuffle";
+    let reducer_id = 0u32;
+
+    let mut client = connect_client(port).await;
+
+    // 1. Push a valid batch with the standard test schema
+    let batch1 = test_client::generate_test_batch(reducer_id as i32, 10);
+    let descriptor = arrow_flight::FlightDescriptor::new_path(vec![
+        shuffle_id.to_string(),
+        reducer_id.to_string(),
+    ]);
+
+    let schema1 = test_client::test_schema();
+    let flight_data_stream1 = arrow_flight::encode::FlightDataEncoderBuilder::new()
+        .with_schema(schema1)
+        .with_flight_descriptor(Some(descriptor.clone()))
+        .build(futures::stream::iter(vec![Ok(batch1)]))
+        .map(|r| r.unwrap());
+
+    let put_res = client.do_put(flight_data_stream1).await;
+    assert!(put_res.is_ok(), "First push with valid schema should succeed");
+
+    // 2. Build a mismatched RecordBatch schema (e.g., key column is Utf8 instead of Int32)
+    use arrow::array::StringArray;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    let mismatched_schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Utf8, false), // different type
+        Field::new("value", DataType::Utf8, false),
+        Field::new("partition_id", DataType::Int32, false),
+    ]));
+
+    let keys = StringArray::from(vec!["not_an_int"; 10]);
+    let values = StringArray::from(vec!["val"; 10]);
+    let partitions = arrow::array::Int32Array::from(vec![reducer_id as i32; 10]);
+
+    let batch2 = arrow::record_batch::RecordBatch::try_new(
+        mismatched_schema.clone(),
+        vec![
+            Arc::new(keys),
+            Arc::new(values),
+            Arc::new(partitions),
+        ],
+    )
+    .unwrap();
+
+    let flight_data_stream2 = arrow_flight::encode::FlightDataEncoderBuilder::new()
+        .with_schema(mismatched_schema)
+        .with_flight_descriptor(Some(descriptor))
+        .build(futures::stream::iter(vec![Ok(batch2)]))
+        .map(|r| r.unwrap());
+
+    // 3. Attempt to push the mismatched batch and verify it fails with InvalidArgument
+    let response_err = client.do_put(flight_data_stream2).await.unwrap_err();
+    assert_eq!(response_err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        response_err.message().contains("Schema mismatch"),
+        "Expected error message to contain 'Schema mismatch', got '{}'",
+        response_err.message()
+    );
+}
+
