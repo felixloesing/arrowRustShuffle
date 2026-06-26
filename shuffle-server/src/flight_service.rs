@@ -229,20 +229,49 @@ impl FlightService for ShuffleFlightService {
         Ok(Response::new(stream.boxed()))
     }
 
-    /// DoAction — not implemented.
+    /// DoAction — implements custom administrative actions, e.g. CleanShuffle.
     async fn do_action(
         &self,
-        _request: Request<Action>,
+        request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
-        Err(Status::unimplemented("DoAction not implemented"))
+        let action = request.into_inner();
+        info!(action_type = %action.r#type, "Received DoAction request");
+
+        if action.r#type == "CleanShuffle" {
+            let shuffle_id = std::str::from_utf8(&action.body)
+                .map_err(|e| Status::invalid_argument(format!("Invalid UTF-8 in shuffle_id: {e}")))?;
+
+            if shuffle_id.is_empty() {
+                return Err(Status::invalid_argument("shuffle_id cannot be empty"));
+            }
+
+            info!(shuffle_id = %shuffle_id, "Explicit shuffle clean action triggered");
+            self.manager.cleanup_shuffle(shuffle_id);
+
+            let result = arrow_flight::Result {
+                body: format!("Successfully cleaned shuffle: {shuffle_id}").into(),
+            };
+
+            let stream = stream::once(async move { Ok(result) });
+            Ok(Response::new(stream.boxed()))
+        } else {
+            Err(Status::unimplemented(format!(
+                "Action '{}' is not implemented",
+                action.r#type
+            )))
+        }
     }
 
-    /// ListActions — returns empty list.
+    /// ListActions — returns supported action types.
     async fn list_actions(
         &self,
         _request: Request<Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
-        let stream = stream::empty();
+        let action_types = vec![Ok(ActionType {
+            r#type: "CleanShuffle".to_string(),
+            description: "Cleans up all cached metadata and spill files on disk for a given shuffle_id".to_string(),
+        })];
+        let stream = stream::iter(action_types);
         Ok(Response::new(stream.boxed()))
     }
 

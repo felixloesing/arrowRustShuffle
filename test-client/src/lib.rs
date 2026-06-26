@@ -49,6 +49,8 @@ pub async fn start_test_server(
     spill_threshold_bytes: usize,
     spill_dir: std::path::PathBuf,
     global_memory_limit_bytes: Option<usize>,
+    shuffle_ttl_secs: Option<u64>,
+    shuffle_cleanup_interval_secs: Option<u64>,
 ) -> u16 {
     let mem_limit = global_memory_limit_bytes.unwrap_or(1024 * 1024 * 1024);
     let memory_manager = Arc::new(shuffle_server::MemoryManager::new(
@@ -58,6 +60,22 @@ pub async fn start_test_server(
         95,
     ));
     let manager = Arc::new(ShuffleManager::new(spill_threshold_bytes, spill_dir, memory_manager));
+
+    // Spawn the background TTL cleanup task if TTL is enabled (>0)
+    let ttl_secs = shuffle_ttl_secs.unwrap_or(0);
+    if ttl_secs > 0 {
+        let manager_clone = manager.clone();
+        let ttl = std::time::Duration::from_secs(ttl_secs);
+        let interval = std::time::Duration::from_secs(shuffle_cleanup_interval_secs.unwrap_or(60));
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                manager_clone.cleanup_expired_shuffles(ttl);
+            }
+        });
+    }
+
     let service = ShuffleFlightService::new(manager);
     let svc = FlightServiceServer::new(service);
 

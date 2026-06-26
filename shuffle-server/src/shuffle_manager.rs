@@ -23,6 +23,7 @@ pub struct ShuffleManager {
     spill_dir: PathBuf,
     memory_manager: Arc<MemoryManager>,
     spill_in_progress: std::sync::atomic::AtomicBool,
+    last_updated: RwLock<HashMap<String, std::time::Instant>>,
 }
 
 impl ShuffleManager {
@@ -43,6 +44,7 @@ impl ShuffleManager {
             spill_dir,
             memory_manager,
             spill_in_progress: std::sync::atomic::AtomicBool::new(false),
+            last_updated: RwLock::new(HashMap::new()),
         }
     }
 
@@ -55,6 +57,11 @@ impl ShuffleManager {
         batch: RecordBatch,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.enforce_memory_limit();
+
+        // Update last updated timestamp for this shuffle_id
+        if let Ok(mut lu) = self.last_updated.write() {
+            lu.insert(shuffle_id.to_string(), std::time::Instant::now());
+        }
 
         let key = (shuffle_id.to_string(), reducer_id);
 
@@ -261,7 +268,40 @@ impl ShuffleManager {
         for key in keys_to_remove {
             partitions.remove(&key);
         }
+
+        // Delete parent shuffle spill directory if it exists
+        let shuffle_dir = self.spill_dir.join(shuffle_id);
+        if shuffle_dir.exists() {
+            let _ = std::fs::remove_dir_all(&shuffle_dir);
+        }
+
+        // Remove from last_updated tracking
+        if let Ok(mut lu) = self.last_updated.write() {
+            lu.remove(shuffle_id);
+        }
+
         info!(shuffle_id, "Shuffle cleaned up");
+    }
+
+    /// Iterates over tracked shuffles, checking if they have expired based on their
+    /// last update timestamp and the provided TTL, and triggers clean up if so.
+    pub fn cleanup_expired_shuffles(&self, ttl: std::time::Duration) {
+        let expired_shuffles: Vec<String> = {
+            if let Ok(lu) = self.last_updated.read() {
+                let now = std::time::Instant::now();
+                lu.iter()
+                    .filter(|(_, &time)| now.duration_since(time) > ttl)
+                    .map(|(sid, _)| sid.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+
+        for shuffle_id in expired_shuffles {
+            info!(shuffle_id, "Shuffle expired, triggering automated cleanup");
+            self.cleanup_shuffle(&shuffle_id);
+        }
     }
 
     /// Enforces the global memory limit, triggering background spills if the high

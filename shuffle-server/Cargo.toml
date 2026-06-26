@@ -2,7 +2,7 @@
 name = "shuffle-server"
 version = "0.1.0"
 edition = "2021"
-description = "A toy external shuffle service for Apache Spark using Arrow Flight"
+description = "External shuffle service using Arrow Flight"
 
 [dependencies]
 arrow = { version = "54", features = ["ipc"] }
